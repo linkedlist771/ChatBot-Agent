@@ -1,0 +1,18 @@
+[project]
+name = "chatbot-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "duckduckgo-search>=7.0.0",
+    "fastapi>=0.127.1",
+    "fastmcp>=2.14.1",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+    "mcp>=1.25.0",
+    "openai>=2.14.0",
+    "python-dotenv>=1.2.1",
+    "tqdm>=4.67.1",
+    "uvicorn>=0.32.0",
+]
