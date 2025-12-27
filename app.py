@@ -229,9 +229,10 @@ class MCPAgentAPI:
 
         use_model = model or self.model
         
-        # 注入系统提示词
+        # 注入系统提示词作为第一条 user message
         system_prompt = get_system_prompt()
-        working_messages = [{"role": "system", "content": system_prompt}]
+        working_messages = [{"role": "user", "content": f"[System Instructions]\n{system_prompt}"}]
+        working_messages.append({"role": "assistant", "content": "understood, I'll follow these instructions."})
         working_messages.extend([
             {"role": m["role"], "content": m["content"]} for m in messages
         ])
