@@ -28,7 +28,8 @@ import sys
 from enum import StrEnum, auto
 from pathlib import Path
 from typing import Any, NamedTuple
-
+from dotenv import load_dotenv
+load_dotenv()
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
