@@ -1674,6 +1674,63 @@ async def python_exec(
 
 
 # ============================================================================
+# Text to Image Tool - 文字生成图片 (Gemini)
+# ============================================================================
+T2I_BASEURL = os.getenv("T2I_BASEURL")
+T2I_API_KEY = os.getenv("T2I_API_KEY")
+
+
+@mcp.tool
+async def text_to_image(
+    prompt: str,
+) -> dict[str, str]:
+    """Generate an image from text description using Gemini.
+
+    Use this tool to create images based on text prompts.
+    The generated image URL can be directly shared with users.
+
+    Args:
+        prompt: A detailed description of the image you want to generate.
+                Be specific about style, colors, composition, etc.
+
+    Returns:
+        dict with image_url on success, or error message on failure.
+
+    Examples:
+        text_to_image("一只可爱的橘猫坐在窗台上看夕阳")
+        text_to_image("A futuristic city skyline at night with neon lights")
+    """
+    if not prompt.strip():
+        return {"image_url": "", "error": "Prompt cannot be empty"}
+
+    if not T2I_BASEURL or not T2I_API_KEY:
+        return {"image_url": "", "error": "T2I_BASEURL or T2I_API_KEY not configured"}
+
+    try:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(base_url=T2I_BASEURL, api_key=T2I_API_KEY)
+        payload = {
+            "model": "gemini-3-pro-imagen",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        response = await client.chat.completions.create(**payload)
+        content = response.choices[0].message.content
+
+        # 解析图片 URL: ![image](https://xxx.jpg)
+        match = re.search(r'!\[image\]\((https?://[^\)]+)\)', content)
+        if not match:
+            return {"image_url": "", "error": f"No image URL found in response: {content[:200]}"}
+
+        return {"image_url": match.group(1)}
+
+    except Exception as e:
+        return {"image_url": "", "error": f"Image generation failed: {e}"}
+
+
+# ============================================================================
 # 运行服务器
 # ============================================================================
 if __name__ == "__main__":
