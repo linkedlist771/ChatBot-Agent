@@ -16,3 +16,6 @@ dependencies = [
     "tqdm>=4.67.1",
     "uvicorn>=0.32.0",
 ]
+
+[tool.setuptools]
+py-modules = ["agent", "tools", "app", "main"]
