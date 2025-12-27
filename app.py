@@ -13,6 +13,10 @@ OpenAI Compatible API Server with MCP Tools
         "messages": [{"role": "user", "content": "你好"}],
         "stream": true
       }'
+
+环境变量配置:
+    WORKING_DIR: 工作目录路径 (默认: ./workspace)
+    RESOURCE_BASE_URL: 资源访问基础 URL (默认: http://localhost:8000/resources)
 """
 
 import asyncio
@@ -21,6 +25,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -29,6 +34,7 @@ load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from mcp import ClientSession, StdioServerParameters
@@ -36,6 +42,50 @@ from mcp.client.stdio import stdio_client
 from contextlib import AsyncExitStack
 
 from openai import AsyncOpenAI
+
+
+# ============================================================================
+# 工作目录配置
+# ============================================================================
+WORKING_DIR = Path(os.getenv("WORKING_DIR", "./workspace")).resolve()
+RESOURCE_BASE_URL = os.getenv("RESOURCE_BASE_URL", "http://localhost:8000/resources")
+
+
+def ensure_working_dir() -> Path:
+    """确保工作目录存在"""
+    WORKING_DIR.mkdir(parents=True, exist_ok=True)
+    return WORKING_DIR
+
+
+def get_system_prompt() -> str:
+    """生成系统提示词，告知 Agent 工作环境"""
+    return f"""You are a helpful AI assistant with access to various tools for file operations, code execution, and web search.
+
+## Working Environment
+
+You are working in a sandboxed environment with the following settings:
+- **Working Directory**: All file operations are restricted to a sandbox directory.
+- **Resource URL Base**: {RESOURCE_BASE_URL}
+
+## Important Rules
+
+1. **File Access**: You can only read, write, and modify files within the sandbox working directory. Paths outside this directory will be rejected.
+
+2. **File URLs**: When you create or modify files using `write_file` or `search_replace` tools, the result will include a `resource_url` field. This URL allows the user to download or view the file directly.
+
+3. **Final Response**: When you complete a task that generates files (e.g., code, documents, images, data files), you MUST include the `resource_url` in your final response so the user can access/download the files.
+
+   Example response format:
+   ```
+   I've created the file for you. You can download it here:
+   - [filename.html]({RESOURCE_BASE_URL}/filename.html)
+   ```
+
+4. **Multiple Files**: If you create multiple files, list all their URLs at the end of your response.
+
+5. **Relative Paths**: When using file tools, use relative paths (e.g., `output/result.html`) rather than absolute paths.
+
+Remember: The user can ONLY access files through the provided URLs, so always include them in your final response when files are created or modified."""
 
 
 # ============================================================================
@@ -164,9 +214,13 @@ class MCPAgentAPI:
         assert self.session is not None
 
         use_model = model or self.model
-        working_messages = [
+        
+        # 注入系统提示词
+        system_prompt = get_system_prompt()
+        working_messages = [{"role": "system", "content": system_prompt}]
+        working_messages.extend([
             {"role": m["role"], "content": m["content"]} for m in messages
-        ]
+        ])
 
         # Tool-calling loop
         for _ in range(10):
@@ -270,6 +324,12 @@ agent: Optional[MCPAgentAPI] = None
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     global agent
+
+    # 确保工作目录存在
+    ensure_working_dir()
+    print(f"[Startup] Working directory: {WORKING_DIR}")
+    print(f"[Startup] Resource base URL: {RESOURCE_BASE_URL}")
+
     agent = MCPAgentAPI()
 
     # 默认连接 tools.py
@@ -293,10 +353,15 @@ async def lifespan(app: FastAPI):
 # ============================================================================
 app = FastAPI(
     title="OpenAI Compatible MCP Agent API",
-    description="OpenAI 兼容的 API，集成 MCP 工具",
+    description="OpenAI 兼容的 API，集成 MCP 工具，支持沙箱文件操作",
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# 挂载静态文件目录，用于访问工作目录中的文件
+# 确保工作目录存在
+ensure_working_dir()
+app.mount("/resources", StaticFiles(directory=str(WORKING_DIR)), name="resources")
 
 
 @app.get("/v1/models")
@@ -399,6 +464,37 @@ async def health():
         "status": "ok",
         "mcp_connected": agent is not None and agent.session is not None,
         "tools_count": len(agent.openai_tools) if agent else 0,
+        "working_dir": str(WORKING_DIR),
+        "resource_base_url": RESOURCE_BASE_URL,
+    }
+
+
+@app.get("/workspace/info")
+async def workspace_info():
+    """获取工作空间信息"""
+    files = []
+    directories = []
+
+    try:
+        for item in WORKING_DIR.iterdir():
+            if item.is_dir():
+                directories.append(item.name)
+            else:
+                files.append(
+                    {
+                        "name": item.name,
+                        "size": item.stat().st_size,
+                        "url": f"{RESOURCE_BASE_URL}/{item.name}",
+                    }
+                )
+    except Exception as e:
+        return {"error": str(e)}
+
+    return {
+        "working_dir": str(WORKING_DIR),
+        "resource_base_url": RESOURCE_BASE_URL,
+        "files": files,
+        "directories": directories,
     }
 
 

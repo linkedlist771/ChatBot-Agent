@@ -52,6 +52,77 @@ DEFAULT_GREP_MAX_MATCHES = 100
 DEFAULT_GREP_TIMEOUT = 60
 MAX_TODOS = 100
 
+# ============================================================================
+# 工作目录配置 (安全沙箱)
+# ============================================================================
+# 通过环境变量配置工作目录，所有文件操作都限制在此目录下
+WORKING_DIR = Path(os.getenv("WORKING_DIR", "./workspace")).resolve()
+# 资源访问的基础 URL
+RESOURCE_BASE_URL = os.getenv("RESOURCE_BASE_URL", "http://localhost:8000/resources")
+
+
+def _ensure_working_dir() -> Path:
+    """确保工作目录存在"""
+    WORKING_DIR.mkdir(parents=True, exist_ok=True)
+    return WORKING_DIR
+
+
+def _is_path_safe(path: Path) -> bool:
+    """检查路径是否在工作目录内（防止路径遍历攻击）"""
+    try:
+        resolved = path.resolve()
+        return resolved == WORKING_DIR or WORKING_DIR in resolved.parents
+    except (ValueError, OSError):
+        return False
+
+
+def _resolve_safe_path(
+    path_str: str, must_exist: bool = False
+) -> tuple[Path | None, str | None]:
+    """
+    安全地解析路径，确保在工作目录内
+
+    Args:
+        path_str: 用户提供的路径
+        must_exist: 是否要求路径必须存在
+
+    Returns:
+        (resolved_path, error_message) - 成功时 error_message 为 None
+    """
+    _ensure_working_dir()
+
+    if not path_str.strip():
+        return None, "Path cannot be empty"
+
+    user_path = Path(path_str).expanduser()
+
+    # 如果是相对路径，相对于工作目录
+    if not user_path.is_absolute():
+        resolved = (WORKING_DIR / user_path).resolve()
+    else:
+        resolved = user_path.resolve()
+
+    # 安全检查
+    if not _is_path_safe(resolved):
+        return (
+            None,
+            f"Access denied: path '{path_str}' is outside working directory '{WORKING_DIR}'",
+        )
+
+    if must_exist and not resolved.exists():
+        return None, f"Path does not exist: {path_str}"
+
+    return resolved, None
+
+
+def _get_resource_url(file_path: Path) -> str:
+    """获取文件的资源访问 URL"""
+    try:
+        relative_path = file_path.relative_to(WORKING_DIR)
+        return f"{RESOURCE_BASE_URL}/{relative_path}"
+    except ValueError:
+        return ""
+
 
 # ============================================================================
 # 辅助函数
@@ -137,16 +208,26 @@ async def bash(
     DO NOT use for file reading (use read_file), searching (use grep),
     or file editing (use write_file/search_replace).
 
+    Note: Commands are executed within the sandbox working directory for security.
+
     Args:
         command: The shell command to execute.
         timeout: Override the default command timeout (default: 30s).
-        working_directory: Directory to run the command in (default: current directory).
+        working_directory: Subdirectory within workspace to run the command in.
 
     Returns:
         dict with stdout, stderr, and returncode.
     """
     effective_timeout = timeout or DEFAULT_BASH_TIMEOUT
-    cwd = Path(working_directory).resolve() if working_directory else Path.cwd()
+
+    # 确保工作目录在沙箱内
+    _ensure_working_dir()
+    if working_directory:
+        cwd, error = _resolve_safe_path(working_directory)
+        if error:
+            return {"stdout": "", "stderr": error, "returncode": -1}
+    else:
+        cwd = WORKING_DIR
 
     proc = None
     try:
@@ -312,12 +393,14 @@ async def grep(
     Very fast and automatically ignores files like .pyc, .venv directories, etc.
     Use this to find function definitions, variable usage, or locate error messages.
 
+    Note: Search is restricted to the sandbox working directory.
+
     Args:
         pattern: The regex pattern to search for.
-        path: The file or directory path to search in (default: current directory).
+        path: The file or directory path to search in (relative to workspace).
         max_matches: Override the default maximum number of matches (default: 100).
         use_default_ignore: Whether to respect .gitignore and .ignore files (default: True).
-        working_directory: Directory to run the search from.
+        working_directory: Subdirectory within workspace to run the search from.
 
     Returns:
         dict with matches, match_count, and was_truncated flag.
@@ -330,13 +413,27 @@ async def grep(
             "error": "Empty search pattern provided.",
         }
 
-    cwd = Path(working_directory).resolve() if working_directory else Path.cwd()
+    _ensure_working_dir()
+
+    # 解析工作目录
+    if working_directory:
+        cwd, error = _resolve_safe_path(working_directory)
+        if error:
+            return {
+                "matches": "",
+                "match_count": 0,
+                "was_truncated": False,
+                "error": error,
+            }
+    else:
+        cwd = WORKING_DIR
+
     effective_max_matches = max_matches or DEFAULT_GREP_MAX_MATCHES
 
-    # 验证路径
-    search_path = Path(path).expanduser()
-    if not search_path.is_absolute():
-        search_path = cwd / search_path
+    # 验证搜索路径
+    search_path, error = _resolve_safe_path(path if path != "." else str(cwd))
+    if error:
+        return {"matches": "", "match_count": 0, "was_truncated": False, "error": error}
 
     if not search_path.exists():
         return {
@@ -360,14 +457,14 @@ async def grep(
     if backend == GrepBackend.RIPGREP:
         cmd = _build_ripgrep_command(
             pattern,
-            path,
+            str(search_path),
             effective_max_matches,
             use_default_ignore,
             DEFAULT_EXCLUDE_PATTERNS,
         )
     else:
         cmd = _build_gnu_grep_command(
-            pattern, path, effective_max_matches, DEFAULT_EXCLUDE_PATTERNS
+            pattern, str(search_path), effective_max_matches, DEFAULT_EXCLUDE_PATTERNS
         )
 
     try:
@@ -449,6 +546,7 @@ async def read_file(
     """Read a UTF-8 file, returning content from a specific line range.
 
     Designed to handle large files safely with pagination.
+    Note: File access is restricted to the sandbox working directory.
 
     Strategy for large files:
     1. Call read_file with a limit (e.g., 1000 lines) to get the start
@@ -456,23 +554,14 @@ async def read_file(
     3. Read next chunk with offset (e.g., offset=1000, limit=1000)
 
     Args:
-        path: The file path to read.
+        path: The file path to read (relative to workspace).
         offset: Line number to start reading from (0-indexed, inclusive).
         limit: Maximum number of lines to read.
-        working_directory: Base directory for relative paths.
+        working_directory: Subdirectory within workspace for relative paths.
 
     Returns:
         dict with path, content, lines_read, and was_truncated flag.
     """
-    if not path.strip():
-        return {
-            "path": "",
-            "content": "",
-            "lines_read": 0,
-            "was_truncated": False,
-            "error": "Path cannot be empty",
-        }
-
     if offset < 0:
         return {
             "path": "",
@@ -491,30 +580,35 @@ async def read_file(
             "error": "Limit must be a positive number",
         }
 
-    cwd = Path(working_directory).resolve() if working_directory else Path.cwd()
+    _ensure_working_dir()
 
+    # 如果指定了工作子目录，先验证
+    if working_directory:
+        base_dir, error = _resolve_safe_path(working_directory)
+        if error:
+            return {
+                "path": "",
+                "content": "",
+                "lines_read": 0,
+                "was_truncated": False,
+                "error": error,
+            }
+    else:
+        base_dir = WORKING_DIR
+
+    # 解析文件路径
     file_path = Path(path).expanduser()
     if not file_path.is_absolute():
-        file_path = cwd / file_path
+        file_path = base_dir / file_path
 
-    try:
-        resolved_path = file_path.resolve()
-    except (ValueError, FileNotFoundError):
+    resolved_path, error = _resolve_safe_path(str(file_path), must_exist=True)
+    if error:
         return {
             "path": str(file_path),
             "content": "",
             "lines_read": 0,
             "was_truncated": False,
-            "error": f"File not found: {file_path}",
-        }
-
-    if not resolved_path.exists():
-        return {
-            "path": str(file_path),
-            "content": "",
-            "lines_read": 0,
-            "was_truncated": False,
-            "error": f"File not found: {file_path}",
+            "error": error,
         }
 
     if resolved_path.is_dir():
@@ -569,73 +663,150 @@ async def read_file(
         }
 
 
-# # ============================================================================
-# # WriteFile Tool - 写入文件
-# # ============================================================================
-# @mcp.tool
-# async def write_file(
-#     path: str,
-#     content: str,
-#     overwrite: bool = False,
-#     create_parent_dirs: bool = True,
-#     working_directory: str | None = None,
-# ) -> dict[str, str | int | bool]:
-#     """Create or overwrite a UTF-8 file.
+# ============================================================================
+# WriteFile Tool - 写入文件
+# ============================================================================
+@mcp.tool
+async def write_file(
+    path: str,
+    content: str,
+    overwrite: bool = False,
+    create_parent_dirs: bool = True,
+    working_directory: str | None = None,
+) -> dict[str, str | int | bool]:
+    """Create or overwrite a UTF-8 file.
 
-#     Fails if file exists unless 'overwrite=True'.
+    Fails if file exists unless 'overwrite=True'.
+    Note: File writes are restricted to the sandbox working directory.
 
-#     Args:
-#         path: The file path to write to.
-#         content: The content to write.
-#         overwrite: Must be set to True to overwrite an existing file.
-#         create_parent_dirs: Whether to create parent directories if they don't exist.
-#         working_directory: Base directory for relative paths.
+    Args:
+        path: The file path to write to (relative to workspace).
+        content: The content to write.
+        overwrite: Must be set to True to overwrite an existing file.
+        create_parent_dirs: Whether to create parent directories if they don't exist.
+        working_directory: Subdirectory within workspace for relative paths.
 
-#     Returns:
-#         dict with path, bytes_written, file_existed, and content.
-#     """
-#     if not path.strip():
-#         return {"path": "", "bytes_written": 0, "file_existed": False, "content": "", "error": "Path cannot be empty"}
+    Returns:
+        dict with path, bytes_written, file_existed, content, and resource_url.
+    """
+    if not path.strip():
+        return {
+            "path": "",
+            "bytes_written": 0,
+            "file_existed": False,
+            "content": "",
+            "resource_url": "",
+            "error": "Path cannot be empty",
+        }
 
-#     content_bytes = len(content.encode("utf-8"))
-#     if content_bytes > MAX_WRITE_BYTES:
-#         return {"path": "", "bytes_written": 0, "file_existed": False, "content": "", "error": f"Content exceeds {MAX_WRITE_BYTES} bytes limit"}
+    content_bytes = len(content.encode("utf-8"))
+    if content_bytes > MAX_WRITE_BYTES:
+        return {
+            "path": "",
+            "bytes_written": 0,
+            "file_existed": False,
+            "content": "",
+            "resource_url": "",
+            "error": f"Content exceeds {MAX_WRITE_BYTES} bytes limit",
+        }
 
-#     cwd = Path(working_directory).resolve() if working_directory else Path.cwd()
+    _ensure_working_dir()
 
-#     file_path = Path(path).expanduser()
-#     if not file_path.is_absolute():
-#         file_path = cwd / file_path
-#     file_path = file_path.resolve()
+    # 如果指定了工作子目录，先验证
+    if working_directory:
+        base_dir, error = _resolve_safe_path(working_directory)
+        if error:
+            return {
+                "path": "",
+                "bytes_written": 0,
+                "file_existed": False,
+                "content": "",
+                "resource_url": "",
+                "error": error,
+            }
+    else:
+        base_dir = WORKING_DIR
 
-#     file_existed = file_path.exists()
+    # 解析文件路径
+    file_path = Path(path).expanduser()
+    if not file_path.is_absolute():
+        file_path = base_dir / file_path
 
-#     if file_existed and not overwrite:
-#         return {"path": str(file_path), "bytes_written": 0, "file_existed": True, "content": "", "error": f"File '{file_path}' exists. Set overwrite=True to replace."}
+    resolved_path, error = _resolve_safe_path(str(file_path))
+    if error:
+        return {
+            "path": str(file_path),
+            "bytes_written": 0,
+            "file_existed": False,
+            "content": "",
+            "resource_url": "",
+            "error": error,
+        }
 
-#     if create_parent_dirs:
-#         file_path.parent.mkdir(parents=True, exist_ok=True)
-#     elif not file_path.parent.exists():
-#         return {"path": str(file_path), "bytes_written": 0, "file_existed": False, "content": "", "error": f"Parent directory does not exist: {file_path.parent}"}
+    file_existed = resolved_path.exists()
 
-#     try:
-#         with open(file_path, mode="w", encoding="utf-8") as f:
-#             f.write(content)
+    if file_existed and not overwrite:
+        return {
+            "path": str(resolved_path),
+            "bytes_written": 0,
+            "file_existed": True,
+            "content": "",
+            "resource_url": "",
+            "error": f"File '{resolved_path}' exists. Set overwrite=True to replace.",
+        }
 
-#         # 记录写入历史
-#         _RECENTLY_WRITTEN_FILES.append(str(file_path))
-#         if len(_RECENTLY_WRITTEN_FILES) > 10:
-#             _RECENTLY_WRITTEN_FILES.pop(0)
+    if create_parent_dirs:
+        # 确保父目录也在工作目录内
+        parent_path, parent_error = _resolve_safe_path(str(resolved_path.parent))
+        if parent_error:
+            return {
+                "path": str(resolved_path),
+                "bytes_written": 0,
+                "file_existed": False,
+                "content": "",
+                "resource_url": "",
+                "error": parent_error,
+            }
+        parent_path.mkdir(parents=True, exist_ok=True)
+    elif not resolved_path.parent.exists():
+        return {
+            "path": str(resolved_path),
+            "bytes_written": 0,
+            "file_existed": False,
+            "content": "",
+            "resource_url": "",
+            "error": f"Parent directory does not exist: {resolved_path.parent}",
+        }
 
-#         return {
-#             "path": str(file_path),
-#             "bytes_written": content_bytes,
-#             "file_existed": file_existed,
-#             "content": content,
-#         }
+    try:
+        with open(resolved_path, mode="w", encoding="utf-8") as f:
+            f.write(content)
 
-#     except Exception as e:
-#         return {"path": str(file_path), "bytes_written": 0, "file_existed": file_existed, "content": "", "error": f"Error writing {file_path}: {e}"}
+        # 记录写入历史
+        _RECENTLY_WRITTEN_FILES.append(str(resolved_path))
+        if len(_RECENTLY_WRITTEN_FILES) > 10:
+            _RECENTLY_WRITTEN_FILES.pop(0)
+
+        # 生成资源 URL
+        resource_url = _get_resource_url(resolved_path)
+
+        return {
+            "path": str(resolved_path),
+            "bytes_written": content_bytes,
+            "file_existed": file_existed,
+            "content": content,
+            "resource_url": resource_url,
+        }
+
+    except Exception as e:
+        return {
+            "path": str(resolved_path),
+            "bytes_written": 0,
+            "file_existed": file_existed,
+            "content": "",
+            "resource_url": "",
+            "error": f"Error writing {resolved_path}: {e}",
+        }
 
 
 # ============================================================================
@@ -774,6 +945,7 @@ async def search_replace(
     """Replace sections of files using SEARCH/REPLACE blocks.
 
     Supports fuzzy matching and detailed error reporting.
+    Note: File access is restricted to the sandbox working directory.
 
     Format:
         <<<<<<< SEARCH
@@ -783,14 +955,14 @@ async def search_replace(
         >>>>>>> REPLACE
 
     Args:
-        file_path: The file to modify.
+        file_path: The file to modify (relative to workspace).
         content: The SEARCH/REPLACE block(s) to apply.
         fuzzy_threshold: Similarity threshold for fuzzy matching (default: 0.9).
         create_backup: Whether to create a .bak backup file.
-        working_directory: Base directory for relative paths.
+        working_directory: Subdirectory within workspace for relative paths.
 
     Returns:
-        dict with file, blocks_applied, lines_changed, content, and warnings.
+        dict with file, blocks_applied, lines_changed, content, resource_url, and warnings.
     """
     file_path_str = file_path.strip()
     content_str = content.strip()
@@ -801,6 +973,7 @@ async def search_replace(
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
             "error": "File path cannot be empty",
         }
@@ -811,6 +984,7 @@ async def search_replace(
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
             "error": "Content size exceeds 100KB limit",
         }
@@ -821,45 +995,66 @@ async def search_replace(
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
             "error": "Empty content provided",
         }
 
-    cwd = Path(working_directory).resolve() if working_directory else Path.cwd()
+    _ensure_working_dir()
 
+    # 如果指定了工作子目录，先验证
+    if working_directory:
+        base_dir, error = _resolve_safe_path(working_directory)
+        if error:
+            return {
+                "file": "",
+                "blocks_applied": 0,
+                "lines_changed": 0,
+                "content": "",
+                "resource_url": "",
+                "warnings": [],
+                "error": error,
+            }
+    else:
+        base_dir = WORKING_DIR
+
+    # 解析文件路径
     target_path = Path(file_path_str).expanduser()
     if not target_path.is_absolute():
-        target_path = cwd / target_path
-    target_path = target_path.resolve()
+        target_path = base_dir / target_path
 
-    if not target_path.exists():
+    resolved_target, error = _resolve_safe_path(str(target_path), must_exist=True)
+    if error:
         return {
             "file": str(target_path),
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
-            "error": f"File does not exist: {target_path}",
+            "error": error,
         }
 
-    if not target_path.is_file():
+    if not resolved_target.is_file():
         return {
-            "file": str(target_path),
+            "file": str(resolved_target),
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
-            "error": f"Path is not a file: {target_path}",
+            "error": f"Path is not a file: {resolved_target}",
         }
 
     # 解析块
     blocks = _parse_search_replace_blocks(content_str)
     if not blocks:
         return {
-            "file": str(target_path),
+            "file": str(resolved_target),
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
             "error": (
                 "No valid SEARCH/REPLACE blocks found in content.\n"
@@ -874,32 +1069,35 @@ async def search_replace(
 
     # 读取文件
     try:
-        with open(target_path, encoding="utf-8") as f:
+        with open(resolved_target, encoding="utf-8") as f:
             original_content = f.read()
     except UnicodeDecodeError as e:
         return {
-            "file": str(target_path),
+            "file": str(resolved_target),
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
             "error": f"Unicode decode error: {e}",
         }
     except PermissionError:
         return {
-            "file": str(target_path),
+            "file": str(resolved_target),
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
-            "error": f"Permission denied reading file: {target_path}",
+            "error": f"Permission denied reading file: {resolved_target}",
         }
     except Exception as e:
         return {
-            "file": str(target_path),
+            "file": str(resolved_target),
             "blocks_applied": 0,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": [],
             "error": f"Error reading file: {e}",
         }
@@ -918,7 +1116,7 @@ async def search_replace(
             )
 
             error_msg = (
-                f"SEARCH/REPLACE block {i} failed: Search text not found in {target_path}\n"
+                f"SEARCH/REPLACE block {i} failed: Search text not found in {resolved_target}\n"
                 f"Search text was:\n{search!r}\n"
                 f"Context analysis:\n{context}"
             )
@@ -957,10 +1155,11 @@ async def search_replace(
         if warnings:
             error_message += "\n\nWarnings:\n" + "\n".join(warnings)
         return {
-            "file": str(target_path),
+            "file": str(resolved_target),
             "blocks_applied": applied,
             "lines_changed": 0,
             "content": "",
+            "resource_url": "",
             "warnings": warnings,
             "error": error_message,
         }
@@ -977,39 +1176,46 @@ async def search_replace(
         if create_backup:
             try:
                 shutil.copy2(
-                    target_path, target_path.with_suffix(target_path.suffix + ".bak")
+                    resolved_target,
+                    resolved_target.with_suffix(resolved_target.suffix + ".bak"),
                 )
             except Exception:
                 pass
 
         # 写入文件
         try:
-            with open(target_path, mode="w", encoding="utf-8") as f:
+            with open(resolved_target, mode="w", encoding="utf-8") as f:
                 f.write(current_content)
         except PermissionError:
             return {
-                "file": str(target_path),
+                "file": str(resolved_target),
                 "blocks_applied": applied,
                 "lines_changed": 0,
                 "content": "",
+                "resource_url": "",
                 "warnings": warnings,
-                "error": f"Permission denied writing to file: {target_path}",
+                "error": f"Permission denied writing to file: {resolved_target}",
             }
         except Exception as e:
             return {
-                "file": str(target_path),
+                "file": str(resolved_target),
                 "blocks_applied": applied,
                 "lines_changed": 0,
                 "content": "",
+                "resource_url": "",
                 "warnings": warnings,
                 "error": f"Error writing file: {e}",
             }
 
+    # 生成资源 URL
+    resource_url = _get_resource_url(resolved_target)
+
     return {
-        "file": str(target_path),
+        "file": str(resolved_target),
         "blocks_applied": applied,
         "lines_changed": lines_changed,
         "content": content_str,
+        "resource_url": resource_url,
         "warnings": warnings,
     }
 
@@ -1116,99 +1322,152 @@ def todo(
             }
 
 
-# # ============================================================================
-# # 额外实用工具
-# # ============================================================================
-# @mcp.tool
-# def list_directory(
-#     path: str = ".",
-#     working_directory: str | None = None,
-#     show_hidden: bool = False,
-# ) -> dict[str, list[str] | str]:
-#     """List files and directories in a given path.
+# ============================================================================
+# 额外实用工具
+# ============================================================================
+@mcp.tool
+def list_directory(
+    path: str = ".",
+    working_directory: str | None = None,
+    show_hidden: bool = False,
+) -> dict[str, list[str] | str]:
+    """List files and directories in a given path.
 
-#     Args:
-#         path: Directory path to list (default: current directory).
-#         working_directory: Base directory for relative paths.
-#         show_hidden: Whether to show hidden files (starting with .).
+    Note: Directory listing is restricted to the sandbox working directory.
 
-#     Returns:
-#         dict with files and directories lists.
-#     """
-#     cwd = Path(working_directory).resolve() if working_directory else Path.cwd()
+    Args:
+        path: Directory path to list (relative to workspace).
+        working_directory: Subdirectory within workspace for relative paths.
+        show_hidden: Whether to show hidden files (starting with .).
 
-#     target_path = Path(path).expanduser()
-#     if not target_path.is_absolute():
-#         target_path = cwd / target_path
+    Returns:
+        dict with files and directories lists.
+    """
+    _ensure_working_dir()
 
-#     if not target_path.exists():
-#         return {"files": [], "directories": [], "error": f"Path does not exist: {path}"}
+    # 如果指定了工作子目录，先验证
+    if working_directory:
+        base_dir, error = _resolve_safe_path(working_directory)
+        if error:
+            return {"files": [], "directories": [], "error": error}
+    else:
+        base_dir = WORKING_DIR
 
-#     if not target_path.is_dir():
-#         return {"files": [], "directories": [], "error": f"Path is not a directory: {path}"}
+    # 解析目标路径
+    target_path = Path(path).expanduser()
+    if not target_path.is_absolute():
+        target_path = base_dir / target_path
 
-#     files: list[str] = []
-#     directories: list[str] = []
+    resolved_path, error = _resolve_safe_path(str(target_path), must_exist=True)
+    if error:
+        return {"files": [], "directories": [], "error": error}
 
-#     try:
-#         for item in sorted(target_path.iterdir()):
-#             if not show_hidden and item.name.startswith("."):
-#                 continue
+    if not resolved_path.is_dir():
+        return {
+            "files": [],
+            "directories": [],
+            "error": f"Path is not a directory: {path}",
+        }
 
-#             if item.is_dir():
-#                 directories.append(item.name + "/")
-#             else:
-#                 files.append(item.name)
+    files: list[str] = []
+    directories: list[str] = []
 
-#         return {"files": files, "directories": directories, "path": str(target_path)}
+    try:
+        for item in sorted(resolved_path.iterdir()):
+            if not show_hidden and item.name.startswith("."):
+                continue
 
-#     except PermissionError:
-#         return {"files": [], "directories": [], "error": f"Permission denied: {path}"}
-#     except Exception as e:
-#         return {"files": [], "directories": [], "error": f"Error listing directory: {e}"}
+            if item.is_dir():
+                directories.append(item.name + "/")
+            else:
+                files.append(item.name)
+
+        return {"files": files, "directories": directories, "path": str(resolved_path)}
+
+    except PermissionError:
+        return {"files": [], "directories": [], "error": f"Permission denied: {path}"}
+    except Exception as e:
+        return {
+            "files": [],
+            "directories": [],
+            "error": f"Error listing directory: {e}",
+        }
 
 
-# @mcp.tool
-# def get_file_info(
-#     path: str,
-#     working_directory: str | None = None,
-# ) -> dict[str, str | int | bool]:
-#     """Get information about a file or directory.
+@mcp.tool
+def get_file_info(
+    path: str,
+    working_directory: str | None = None,
+) -> dict[str, str | int | bool]:
+    """Get information about a file or directory.
 
-#     Args:
-#         path: The file or directory path.
-#         working_directory: Base directory for relative paths.
+    Note: File info is restricted to the sandbox working directory.
 
-#     Returns:
-#         dict with file/directory information.
-#     """
-#     cwd = Path(working_directory).resolve() if working_directory else Path.cwd()
+    Args:
+        path: The file or directory path (relative to workspace).
+        working_directory: Subdirectory within workspace for relative paths.
 
-#     target_path = Path(path).expanduser()
-#     if not target_path.is_absolute():
-#         target_path = cwd / target_path
+    Returns:
+        dict with file/directory information and resource_url for files.
+    """
+    _ensure_working_dir()
 
-#     if not target_path.exists():
-#         return {"exists": False, "path": str(target_path), "error": f"Path does not exist: {path}"}
+    # 如果指定了工作子目录，先验证
+    if working_directory:
+        base_dir, error = _resolve_safe_path(working_directory)
+        if error:
+            return {"exists": False, "path": "", "error": error}
+    else:
+        base_dir = WORKING_DIR
 
-#     try:
-#         stat_info = target_path.stat()
+    # 解析目标路径
+    target_path = Path(path).expanduser()
+    if not target_path.is_absolute():
+        target_path = base_dir / target_path
 
-#         return {
-#             "exists": True,
-#             "path": str(target_path.resolve()),
-#             "name": target_path.name,
-#             "is_file": target_path.is_file(),
-#             "is_directory": target_path.is_dir(),
-#             "is_symlink": target_path.is_symlink(),
-#             "size_bytes": stat_info.st_size,
-#             "extension": target_path.suffix if target_path.is_file() else "",
-#         }
+    resolved_path, error = _resolve_safe_path(str(target_path))
+    if error:
+        return {"exists": False, "path": str(target_path), "error": error}
 
-#     except PermissionError:
-#         return {"exists": True, "path": str(target_path), "error": f"Permission denied: {path}"}
-#     except Exception as e:
-#         return {"exists": False, "path": str(target_path), "error": f"Error getting file info: {e}"}
+    if not resolved_path.exists():
+        return {
+            "exists": False,
+            "path": str(resolved_path),
+            "error": f"Path does not exist: {path}",
+        }
+
+    try:
+        stat_info = resolved_path.stat()
+
+        result = {
+            "exists": True,
+            "path": str(resolved_path),
+            "name": resolved_path.name,
+            "is_file": resolved_path.is_file(),
+            "is_directory": resolved_path.is_dir(),
+            "is_symlink": resolved_path.is_symlink(),
+            "size_bytes": stat_info.st_size,
+            "extension": resolved_path.suffix if resolved_path.is_file() else "",
+        }
+
+        # 如果是文件，添加资源 URL
+        if resolved_path.is_file():
+            result["resource_url"] = _get_resource_url(resolved_path)
+
+        return result
+
+    except PermissionError:
+        return {
+            "exists": True,
+            "path": str(resolved_path),
+            "error": f"Permission denied: {path}",
+        }
+    except Exception as e:
+        return {
+            "exists": False,
+            "path": str(resolved_path),
+            "error": f"Error getting file info: {e}",
+        }
 
 
 # ============================================================================
@@ -1305,14 +1564,14 @@ async def python_exec(
         Use this tool to run Python code snippets, perform calculations,
         data processing, or test code logic.
 
-        The code runs in a subprocess with access to standard libraries.
+        The code runs in a subprocess within the sandbox working directory.
         For security, network access and file writes outside working directory
-        should be avoided.
+        are restricted.
 
         Args:
             code: The Python code to execute.
             timeout: Maximum execution time in seconds (default: 30).
-            working_directory: Directory to run the code in.
+            working_directory: Subdirectory within workspace to run the code in.
 
         Returns:
             dict with stdout, stderr, returncode, and success flag.
@@ -1340,7 +1599,16 @@ async def python_exec(
         }
 
     effective_timeout = timeout or DEFAULT_PYTHON_TIMEOUT
-    cwd = Path(working_directory).resolve() if working_directory else Path.cwd()
+
+    _ensure_working_dir()
+
+    # 解析工作目录
+    if working_directory:
+        cwd, error = _resolve_safe_path(working_directory)
+        if error:
+            return {"stdout": "", "stderr": error, "returncode": -1, "success": False}
+    else:
+        cwd = WORKING_DIR
 
     proc = None
     try:
